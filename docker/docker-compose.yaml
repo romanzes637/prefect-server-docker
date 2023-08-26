@@ -1,0 +1,211 @@
+version: "3.9"
+
+services:
+  minio-prefect:
+    image: quay.io/minio/minio:RELEASE.2022-06-25T15-50-16Z
+    entrypoint:  ["minio", "server", "--address", "0.0.0.0:9000", "--console-address", "0.0.0.0:9001", "/data"]
+    expose:
+      - 9000  # server
+      - 9001  # console
+    networks:
+      - prefect
+    env_file:
+      - .env
+      - .env.secret
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 20s
+      retries: 3
+    volumes:
+      - minio_prefect:/data
+    restart: always
+    profiles: 
+      - storage
+      - server
+
+  nginx-minio-prefect:
+    image: nginx:1.19.2-alpine
+    volumes:
+      - ./minio/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - 9010:9000  # server
+      - 9011:9001  # console
+    networks:
+      - prefect
+    depends_on:
+      - minio-prefect
+    restart: always
+    profiles: 
+      - storage
+      - server
+    
+  minio-prefect-init:
+    image: quay.io/minio/mc:RELEASE.2023-08-15T23-03-09Z
+    env_file:
+      - .env
+      - .env.secret
+    networks:
+      - prefect
+    depends_on:
+      - nginx-minio-prefect
+    volumes:
+      - ./minio/init.sh:/init.sh
+    entrypoint: bash -c "./init.sh"
+    # entrypoint: >
+    #   /bin/sh -c "
+    #   until (/usr/bin/mc config host add minio-prefect http://nginx-minio-prefect:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}) do echo '...waiting...' && sleep 1; done;
+    #   /usr/bin/mc mb minio-prefect/$${MINIO_PREFECT_FLOWS_BUCKET_NAME};
+    #   /usr/bin/mc mb minio-prefect/$${MINIO_PREFECT_ARTIFACTS_BUCKET_NAME};
+    #   exit 0;
+    #   "  
+    profiles: 
+      - storage
+      - server
+
+  postgres-prefect:
+    image: postgres:15.4
+    env_file:
+      - .env
+      - .env.secret
+    expose:
+      - 5432
+    volumes: 
+      - postgres_prefect:/var/lib/postgresql/data
+    networks:
+      - prefect
+    restart: always
+    profiles: 
+      - server
+    
+  pgadmin-prefect:
+    image: dpage/pgadmin4:7.5
+    env_file:
+      - .env
+      - .env.secret
+    environment:
+      PGADMIN_LISTEN_PORT: 5051
+    volumes:
+       - pgadmin_prefect:/var/lib/pgadmin
+    ports:
+      - 5051:5051
+    networks:
+      - prefect
+    restart: always
+    profiles: 
+      - server
+      
+  prefect:
+    # image: prefecthq/prefect:2.10.17-python3.11
+    image: prefect
+    build: ./prefect
+    volumes:
+      - prefect_data:/root/.prefect
+      - prefect_flows:/flows
+    # backend-store-uri template "postgresql://user:password@host:port/db"
+    entrypoint: >
+      /bin/sh -c "
+      prefect config view --show-defaults &&
+      PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://$${POSTGRES_USER}:$${POSTGRES_PASSWORD}@postgres-prefect:5432/$${POSTGRES_DB} 
+      prefect server start"
+    env_file:
+      - .env
+      - .env.secret
+    # ports:
+    #   - 4200:4200
+    expose:
+      - 4200
+    depends_on:
+      - postgres-prefect
+    networks:
+      - prefect
+    restart: always
+    profiles: 
+      - server
+
+  nginx-prefect:
+    image: nginx:1.19.2-alpine
+    volumes:
+      - ./prefect/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./.htpasswd:/etc/nginx/.htpasswd
+    ports:
+       - 4200:4200
+    networks:
+      - prefect
+    depends_on:
+      - prefect
+    restart: always
+    profiles: 
+      - server
+
+  prefect-init:
+    image: prefect
+    build: ./prefect
+    entrypoint: bash -c "./init.sh"
+    working_dir: /
+    volumes:
+      - ./prefect/init.sh:/init.sh
+    env_file:
+      - .env.secret
+      - .env
+    depends_on:
+      - minio-prefect-init
+      - nginx-prefect
+    profiles: 
+      - server
+ 
+  prefect-cli:
+    image: prefect
+    build: ./prefect
+    entrypoint: > 
+      bash -c "export PREFECT_API_URL=$${PREFECT_API_URL_AUTH} && bash"
+    working_dir: "/tests"
+    volumes:
+      - "./tests:/tests"
+    env_file:
+      - .env
+      - .env.secret
+    profiles: 
+      - cli 
+ 
+  worker:
+    image: worker
+    build: ./worker
+    # See https://docs.prefect.io/2.11.5/concepts/work-pools/#worker-options
+    entrypoint: >
+       bash -c "
+       PREFECT_API_URL=$${PREFECT_API_URL_AUTH}
+       prefect worker start -p default-process-pool --work-queue default --type process"
+    env_file:
+      - .env
+      - .env.secret
+    profiles: 
+      - worker
+    restart: always
+    
+  agent:
+    image: agent
+    build: ./agent
+    # See https://docs.prefect.io/2.11.5/concepts/agents/#agent-options
+    entrypoint: >
+       bash -c "
+       PREFECT_API_URL=$${PREFECT_API_URL_AUTH}
+       prefect agent start --pool default-process-pool --work-queue default"
+    env_file:
+      - .env
+      - .env.secret
+    profiles: 
+      - agent
+    restart: always
+    
+networks:
+  prefect:
+    driver: bridge
+
+volumes:
+  minio_prefect:
+  postgres_prefect:
+  pgadmin_prefect:
+  prefect_data:
+  prefect_flows:
+  
